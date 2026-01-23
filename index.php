@@ -1,92 +1,203 @@
 <?php
-// ===== Database Connection =====
-$host = "localhost";
-$user = "root";
-$pass = "root123"; // enter your MySQL password if any
-$dbname = "bte_result_system"; // your database name
-$port="3307";
+// ===== Configuration =====
+// TODO: Move these to a config file outside web root or use environment variables
+$host = getenv('DB_HOST') ?: "localhost";
+$user = getenv('DB_USER') ?: "root";
+$pass = getenv('DB_PASS') ?: "root123"; // Change this!
+$dbname = getenv('DB_NAME') ?: "bte_result_system";
+$port = getenv('DB_PORT') ?: "3307";
 
+// Start session for CSRF protection
+session_start();
+
+// ===== Database Connection =====
 $conn = new mysqli($host, $user, $pass, $dbname, $port);
 if ($conn->connect_error) {
-    die("Connection failed: " . $conn->connect_error);
+    error_log("Database connection failed: " . $conn->connect_error);
+    die("Connection failed. Please try again later.");
+}
+
+// Set charset to prevent encoding issues
+$conn->set_charset("utf8mb4");
+
+// ===== Helper Functions =====
+function generateCSRFToken() {
+    if (empty($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['csrf_token'];
+}
+
+function validateCSRFToken($token) {
+    return isset($_SESSION['csrf_token']) && hash_equals($_SESSION['csrf_token'], $token);
+}
+
+function sanitizeInput($data) {
+    return htmlspecialchars(strip_tags(trim($data)), ENT_QUOTES, 'UTF-8');
+}
+
+function validateEmail($email) {
+    return filter_var($email, FILTER_VALIDATE_EMAIL) !== false;
+}
+
+function validatePassword($password) {
+    // At least 8 characters, 1 uppercase, 1 lowercase, 1 number
+    return strlen($password) >= 8 && 
+           preg_match('/[A-Z]/', $password) && 
+           preg_match('/[a-z]/', $password) && 
+           preg_match('/[0-9]/', $password);
+}
+
+function validateRole($role) {
+    return in_array($role, ['student', 'faculty']);
 }
 
 // ===== Get Institute List =====
-$institutes_res = $conn->query("SELECT Inst_ID, Inst_Name FROM institution ORDER BY Inst_Name");
 $institutes = [];
-if ($institutes_res && $institutes_res->num_rows > 0) {
-    $institutes = $institutes_res->fetch_all(MYSQLI_ASSOC);
+$stmt = $conn->prepare("SELECT Inst_ID, Inst_Name FROM institution ORDER BY Inst_Name");
+if ($stmt) {
+    $stmt->execute();
+    $result = $stmt->get_result();
+    if ($result && $result->num_rows > 0) {
+        $institutes = $result->fetch_all(MYSQLI_ASSOC);
+    }
+    $stmt->close();
 }
 
 // ===== Handle Principal Info Request =====
 $institute_info = null;
-if (isset($_POST['inst_info']) && $_POST['inst_info'] !== "") {
-    $inst_id = (int) $_POST['inst_info'];
-    $sql = "SELECT Inst_Name, Principal, Contact_No1, Contact_No2, Contact_No3 
-            FROM institution 
-            WHERE Inst_ID = ?";
-    if ($stmt = $conn->prepare($sql)) {
-        $stmt->bind_param("i", $inst_id);
-        $stmt->execute();
-        $institute_info = $stmt->get_result()->fetch_assoc();
-        $stmt->close();
+if (isset($_POST['inst_info']) && $_POST['inst_info'] !== "" && isset($_POST['csrf_token_info'])) {
+    if (validateCSRFToken($_POST['csrf_token_info'])) {
+        $inst_id = filter_var($_POST['inst_info'], FILTER_VALIDATE_INT);
+        if ($inst_id !== false && $inst_id > 0) {
+            $stmt = $conn->prepare("SELECT Inst_Name, Principal, Contact_No1, Contact_No2, Contact_No3 
+                                   FROM institution 
+                                   WHERE Inst_ID = ?");
+            if ($stmt) {
+                $stmt->bind_param("i", $inst_id);
+                $stmt->execute();
+                $result = $stmt->get_result();
+                $institute_info = $result->fetch_assoc();
+                $stmt->close();
+            }
+        }
     }
 }
 
 // ===== Handle Course List Request =====
 $courses = null;
-if (isset($_POST['institute']) && $_POST['institute'] !== "") {
-    $inst_id = (int) $_POST['institute'];
-    $sql = "SELECT p.Prog_Name, ip.Seats 
-            FROM institution_program ip
-            JOIN program p ON ip.Prog_ID = p.Prog_ID
-            WHERE ip.Inst_ID = ?";
-    if ($stmt = $conn->prepare($sql)) {
-        $stmt->bind_param("i", $inst_id);
-        $stmt->execute();
-        $courses = $stmt->get_result();
-        $stmt->close();
+if (isset($_POST['institute']) && $_POST['institute'] !== "" && isset($_POST['csrf_token_courses'])) {
+    if (validateCSRFToken($_POST['csrf_token_courses'])) {
+        $inst_id = filter_var($_POST['institute'], FILTER_VALIDATE_INT);
+        if ($inst_id !== false && $inst_id > 0) {
+            $stmt = $conn->prepare("SELECT p.Prog_Name, ip.Seats 
+                                   FROM institution_program ip
+                                   JOIN program p ON ip.Prog_ID = p.Prog_ID
+                                   WHERE ip.Inst_ID = ?");
+            if ($stmt) {
+                $stmt->bind_param("i", $inst_id);
+                $stmt->execute();
+                $courses = $stmt->get_result();
+                $stmt->close();
+            }
+        }
     }
 }
 
 // ===== Handle Registration Form =====
 $registration_message = "";
+$registration_success = false;
+
 if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['register_submit'])) {
-    // Create username table if it doesn't exist
-    $table_sql = "CREATE TABLE IF NOT EXISTS username (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        name VARCHAR(100) NOT NULL,
-        email VARCHAR(100) NOT NULL UNIQUE,
-        password VARCHAR(255) NOT NULL,
-        role VARCHAR(50) NOT NULL
-    )";
-    $conn->query($table_sql);
+    $errors = [];
     
-    $name = $conn->real_escape_string($_POST['name']);
-    $email = $conn->real_escape_string($_POST['email']);
-    $password = $conn->real_escape_string($_POST['password']);
-    $role = $conn->real_escape_string($_POST['role']);
+    // Validate CSRF token
+    if (!isset($_POST['csrf_token']) || !validateCSRFToken($_POST['csrf_token'])) {
+        $errors[] = "Invalid security token. Please try again.";
+    }
     
-    // Hash the password
-    $hashed_password = password_hash($password, PASSWORD_DEFAULT);
+    // Get and validate inputs
+    $name = isset($_POST['name']) ? trim($_POST['name']) : '';
+    $email = isset($_POST['email']) ? trim($_POST['email']) : '';
+    $password = isset($_POST['password']) ? $_POST['password'] : '';
+    $role = isset($_POST['role']) ? $_POST['role'] : '';
     
-    // Check if email already exists
-    $check_sql = "SELECT id FROM username WHERE email = '$email'";
-    $result = $conn->query($check_sql);
+    // Validation
+    if (empty($name) || strlen($name) < 2 || strlen($name) > 100) {
+        $errors[] = "Name must be between 2 and 100 characters.";
+    }
     
-    if ($result && $result->num_rows > 0) {
-        $registration_message = "<span style='color: red;'>Error: Email already exists!</span>";
-    } else {
-        // Insert into database
-        $sql = "INSERT INTO username (name, email, password, role) VALUES ('$name', '$email', '$hashed_password', '$role')";
+    if (!validateEmail($email)) {
+        $errors[] = "Invalid email address.";
+    }
+    
+    if (!validatePassword($password)) {
+        $errors[] = "Password must be at least 8 characters with uppercase, lowercase, and a number.";
+    }
+    
+    if (!validateRole($role)) {
+        $errors[] = "Invalid role selected.";
+    }
+    
+    // If no validation errors, proceed with database operations
+    if (empty($errors)) {
+        // Create table if it doesn't exist (do this once, ideally in a setup script)
+        $table_sql = "CREATE TABLE IF NOT EXISTS username (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(100) NOT NULL,
+            email VARCHAR(100) NOT NULL UNIQUE,
+            password VARCHAR(255) NOT NULL,
+            role VARCHAR(50) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_email (email)
+        )";
+        $conn->query($table_sql);
         
-        if ($conn->query($sql) === TRUE) {
-            $registration_message = "<span style='color: green;'>Registration successful! Welcome, $name!</span>";
+        // Check if email already exists
+        $check_stmt = $conn->prepare("SELECT id FROM username WHERE email = ?");
+        if ($check_stmt) {
+            $check_stmt->bind_param("s", $email);
+            $check_stmt->execute();
+            $check_result = $check_stmt->get_result();
+            
+            if ($check_result->num_rows > 0) {
+                $errors[] = "Email already registered.";
+            } else {
+                // Hash password and insert
+                $hashed_password = password_hash($password, PASSWORD_DEFAULT);
+                
+                $insert_stmt = $conn->prepare("INSERT INTO username (name, email, password, role) VALUES (?, ?, ?, ?)");
+                if ($insert_stmt) {
+                    $insert_stmt->bind_param("ssss", $name, $email, $hashed_password, $role);
+                    
+                    if ($insert_stmt->execute()) {
+                        $registration_success = true;
+                        $registration_message = "Registration successful! Welcome, " . sanitizeInput($name) . "!";
+                    } else {
+                        error_log("Registration insert error: " . $insert_stmt->error);
+                        $errors[] = "Registration failed. Please try again.";
+                    }
+                    $insert_stmt->close();
+                } else {
+                    $errors[] = "System error. Please try again.";
+                }
+            }
+            $check_stmt->close();
         } else {
-            $registration_message = "<span style='color: red;'>Error: " . $conn->error . "</span>";
+            $errors[] = "System error. Please try again.";
         }
     }
+    
+    // Display errors
+    if (!empty($errors)) {
+        $registration_message = implode("<br>", array_map(function($err) {
+            return sanitizeInput($err);
+        }, $errors));
+    }
 }
+
+// Generate CSRF tokens for all forms
+$csrf_token = generateCSRFToken();
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -111,8 +222,8 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['register_submit'])) {
     height: 90px;
   }
   header img {
-    height: 60px;              /* 🔹 Reduced size */
-    width: auto;               /* Keep natural aspect ratio */
+    height: 60px;
+    width: auto;
   }
   header .emblem {
     position: absolute;
@@ -123,7 +234,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['register_submit'])) {
     right: 25px;
   }
   header h1 {
-    font-size: 22px;           /* Slightly smaller for better alignment */
+    font-size: 22px;
     margin: 0;
     text-align: center;
     line-height: 1.4;
@@ -170,7 +281,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['register_submit'])) {
     box-shadow: 0 0 5px rgba(0,0,0,0.1);
     width: 60%;
   }
-  /* Layout Styles */
   .main-wrapper {
     display: flex;
     gap: 20px;
@@ -201,7 +311,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['register_submit'])) {
     font-size: 14px;
     line-height: 1.6;
   }
-  /* Dashboard container */
   .dashboard-container {
     padding: 30px;
   }
@@ -244,7 +353,24 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['register_submit'])) {
     border-radius: 5px;
     text-align: center;
   }
+  .message.success {
+    background-color: #d4edda;
+    color: #155724;
+    border: 1px solid #c3e6cb;
+  }
+  .message.error {
+    background-color: #f8d7da;
+    color: #721c24;
+    border: 1px solid #f5c6cb;
+  }
+  .password-requirements {
+    font-size: 12px;
+    color: #666;
+    margin-top: 5px;
+  }
 </style>
+</head>
+<body>
 
 <header>
   <img src="emblem.jpg" alt="Emblem" class="emblem">
@@ -259,28 +385,42 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['register_submit'])) {
   <div class="registration-section">
     <h2>User Registration</h2>
     <?php if ($registration_message): ?>
-        <div class="message"><?= $registration_message ?></div>
+        <div class="message <?= $registration_success ? 'success' : 'error' ?>">
+            <?= $registration_message ?>
+        </div>
     <?php endif; ?>
     <form method="POST" action="">
+        <input type="hidden" name="csrf_token" value="<?= $csrf_token ?>">
+        
         <div class="form-group">
-            <label for="name">Name</label>
-            <input type="text" id="name" name="name" required>
+            <label for="name">Full Name *</label>
+            <input type="text" id="name" name="name" required minlength="2" maxlength="100"
+                   value="<?= isset($_POST['name']) && !$registration_success ? sanitizeInput($_POST['name']) : '' ?>">
         </div>
+        
         <div class="form-group">
-            <label for="email">Email</label>
-            <input type="email" id="email" name="email" required>
+            <label for="email">Email Address *</label>
+            <input type="email" id="email" name="email" required
+                   value="<?= isset($_POST['email']) && !$registration_success ? sanitizeInput($_POST['email']) : '' ?>">
         </div>
+        
         <div class="form-group">
-            <label for="password">Password</label>
-            <input type="password" id="password" name="password" required>
+            <label for="password">Password *</label>
+            <input type="password" id="password" name="password" required minlength="8">
+            <div class="password-requirements">
+                Must be at least 8 characters with uppercase, lowercase, and a number
+            </div>
         </div>
+        
         <div class="form-group">
-            <label for="role">Role</label>
+            <label for="role">Role *</label>
             <select id="role" name="role" required>
-                <option value="student">Student</option>
-                <option value="faculty">Faculty</option>
+                <option value="">-- Select Role --</option>
+                <option value="student" <?= (isset($_POST['role']) && $_POST['role'] === 'student') ? 'selected' : '' ?>>Student</option>
+                <option value="faculty" <?= (isset($_POST['role']) && $_POST['role'] === 'faculty') ? 'selected' : '' ?>>Faculty</option>
             </select>
         </div>
+        
         <div class="form-group">
             <button type="submit" name="register_submit">Register</button>
         </div>
@@ -292,7 +432,13 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['register_submit'])) {
     <h3>📢 Announcements</h3>
     <p><strong>Welcome!</strong> Register to access the BTE Result System.</p>
     <p>Please enter your details carefully. Make sure to choose your correct role - Student or Faculty.</p>
-    <p>Your password will be securely stored and encrypted.</p>
+    <p><strong>Password Requirements:</strong></p>
+    <ul style="font-size: 13px; line-height: 1.8;">
+      <li>At least 8 characters long</li>
+      <li>Contains uppercase letters</li>
+      <li>Contains lowercase letters</li>
+      <li>Contains numbers</li>
+    </ul>
     <p style="margin-top: 20px; border-top: 1px solid rgba(255,255,255,0.3); padding-top: 15px;">
       <strong>Important:</strong> Keep your credentials safe and do not share your password with anyone.
     </p>
@@ -303,15 +449,16 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['register_submit'])) {
 <div class="dashboard-container">
   <div class="container">
 
-    <!-- 🔹 Form 1: Show Principal & Contact Info -->
+    <!-- Form 1: Show Principal & Contact Info -->
     <form method="POST" action="">
+        <input type="hidden" name="csrf_token_info" value="<?= $csrf_token ?>">
         <h3>View Institute Information</h3>
         <select name="inst_info" required>
             <option value="">-- Select Institute --</option>
             <?php foreach ($institutes as $row): ?>
                 <option value="<?= (int)$row['Inst_ID'] ?>"
                     <?= (isset($_POST['inst_info']) && $_POST['inst_info'] == $row['Inst_ID']) ? 'selected' : '' ?>>
-                    <?= htmlspecialchars($row['Inst_Name']) ?>
+                    <?= sanitizeInput($row['Inst_Name']) ?>
                 </option>
             <?php endforeach; ?>
         </select>
@@ -320,25 +467,26 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['register_submit'])) {
 
     <?php if ($institute_info): ?>
         <div class="info">
-            <h3><?= htmlspecialchars($institute_info['Inst_Name']) ?></h3>
-            <p><strong>Principal:</strong> <?= htmlspecialchars($institute_info['Principal'] ?? '-') ?></p>
+            <h3><?= sanitizeInput($institute_info['Inst_Name']) ?></h3>
+            <p><strong>Principal:</strong> <?= sanitizeInput($institute_info['Principal'] ?? '-') ?></p>
             <p><strong>Contact Numbers:</strong>
-                <?= htmlspecialchars($institute_info['Contact_No1'] ?? '-') ?>,
-                <?= htmlspecialchars($institute_info['Contact_No2'] ?? '-') ?>,
-                <?= htmlspecialchars($institute_info['Contact_No3'] ?? '-') ?>
+                <?= sanitizeInput($institute_info['Contact_No1'] ?? '-') ?>,
+                <?= sanitizeInput($institute_info['Contact_No2'] ?? '-') ?>,
+                <?= sanitizeInput($institute_info['Contact_No3'] ?? '-') ?>
             </p>
         </div>
     <?php endif; ?>
 
-    <!-- 🔹 Form 2: Show Course List -->
+    <!-- Form 2: Show Course List -->
     <form method="POST" action="">
+        <input type="hidden" name="csrf_token_courses" value="<?= $csrf_token ?>">
         <h3>View Courses Offered by Institute</h3>
         <select name="institute" required>
             <option value="">-- Select Institute --</option>
             <?php foreach ($institutes as $row): ?>
                 <option value="<?= (int)$row['Inst_ID'] ?>"
                     <?= (isset($_POST['institute']) && $_POST['institute'] == $row['Inst_ID']) ? 'selected' : '' ?>>
-                    <?= htmlspecialchars($row['Inst_Name']) ?>
+                    <?= sanitizeInput($row['Inst_Name']) ?>
                 </option>
             <?php endforeach; ?>
         </select>
@@ -354,12 +502,12 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['register_submit'])) {
             </tr>
             <?php while ($row = $courses->fetch_assoc()): ?>
                 <tr>
-                    <td><?= htmlspecialchars($row['Prog_Name']) ?></td>
-                    <td><?= htmlspecialchars($row['Seats']) ?></td>
+                    <td><?= sanitizeInput($row['Prog_Name']) ?></td>
+                    <td><?= sanitizeInput($row['Seats']) ?></td>
                 </tr>
             <?php endwhile; ?>
         </table>
-    <?php elseif (isset($_POST['institute'])): ?>
+    <?php elseif (isset($_POST['institute']) && validateCSRFToken($_POST['csrf_token_courses'] ?? '')): ?>
         <p><em>No courses found for this institute.</em></p>
     <?php endif; ?>
   </div>
@@ -367,3 +515,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['register_submit'])) {
 
 </body>
 </html>
+<?php
+$conn->close();
+?>
