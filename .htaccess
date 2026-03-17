@@ -1,0 +1,24 @@
+# Set index.php as the default file
+DirectoryIndex index.php index.html
+
+# Disable directory browsing
+Options -Indexes
+
+# Enable error reporting (for development only - remove in production)
+php_flag display_errors On
+php_flag display_startup_errors On
+
+# Set default charset
+AddDefaultCharset UTF-8
+
+# Enable URL rewriting (optional - for future use)
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteBase /
+</IfModule>
+
+# Protect sensitive files
+<FilesMatch "^\.">
+    Order allow,deny
+    Deny from all
+</FilesMatch>
